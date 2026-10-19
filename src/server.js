@@ -8,6 +8,7 @@
 //
 // Admin (Bearer ADMIN_TOKEN):
 //   GET  /api/admin/keys
+//   POST /api/admin/keys/:key/extend  { expiresAt }
 //   POST /api/admin/keys/:key/revoke
 //   POST /api/admin/keys/:key/reset
 // =============================================================
@@ -367,6 +368,24 @@ app.post('/api/admin/keys', requireAdmin, (req, res) => {
     stmts.insertKey.run(key, now, type, expiresAt, pack, notes ?? null);
     logEvent(key, 'create', null, req.ip, `admin/${type}/${pack}`);
     res.status(201).json({ ok: true, key, type, pack, expiresAt });
+});
+
+// Push a key's expiry forward. Called by the website on every paid
+// Stripe renewal invoice (subscriptions). Never shortens a key: a late
+// or replayed webhook can't cut a customer's remaining time. The client
+// picks the new expiry up on its next /verify (token re-issued there).
+const AdminExtendSchema = z.object({
+    expiresAt: z.number().int().positive(),
+});
+
+app.post('/api/admin/keys/:key/extend', requireAdmin, (req, res) => {
+    const parsed = AdminExtendSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid-body' });
+    const r = stmts.extendKey.run(parsed.data.expiresAt, req.params.key);
+    if (r.changes !== 1) return res.status(404).json({ error: 'unknown-key' });
+    const lic = stmts.findKey.get(req.params.key);
+    logEvent(req.params.key, 'extend', null, req.ip, String(lic.expires_at));
+    res.json({ ok: true, key: lic.key, expiresAt: lic.expires_at });
 });
 
 app.post('/api/admin/keys/:key/revoke', requireAdmin, (req, res) => {

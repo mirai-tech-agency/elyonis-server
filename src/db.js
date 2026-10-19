@@ -146,6 +146,11 @@ export const stmts = {
     VALUES (?, 'pool', ?, ?, ?, ?, ?)
   `),
   revokeKey:   db.prepare(`UPDATE licenses SET status = 'revoked' WHERE key = ?`),
+  extendKey:   db.prepare(`
+    UPDATE licenses
+    SET expires_at = MAX(COALESCE(expires_at, 0), ?)
+    WHERE key = ? AND type != 'perpetual' AND status != 'revoked'
+  `),
 
   // Aggregate counters for the admin dashboard. Expiry is derived rather
   // than stored (nothing sweeps expired rows into a status), so every
