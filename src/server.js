@@ -1,5 +1,5 @@
 // =============================================================
-// Elyonis license server -- Express + better-sqlite3.
+// Elyonis license server -- Express + Postgres (Neon).
 //
 // Public:
 //   POST /api/license/activate    { key, machineId }
@@ -17,7 +17,7 @@ import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 
-import { db, stmts, nowSec } from './db.js';
+import { all, get, stmts, nowSec } from './db.js';
 import { randomKey } from './keys.js';
 import * as hmac from './hmac.js';
 
@@ -38,11 +38,16 @@ app.set('trust proxy', 1);
 // ---------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------
+// Fire-and-forget: the audit row must never delay or fail the response.
 function logEvent(key, event, machineId, ip, detail) {
-    try { stmts.logEvent.run(key, event, machineId ?? null, ip ?? null,
-                              detail ?? null, nowSec()); }
-    catch (e) { console.error('logEvent failed:', e.message); }
+    stmts.logEvent(key, event, machineId ?? null, ip ?? null,
+                   detail ?? null, nowSec())
+        .catch(e => console.error('logEvent failed:', e.message));
 }
+
+// Express 4 doesn't catch rejected promises: route them to the error
+// handler instead of leaving the request hanging.
+const wrap = fn => (req, res, next) => fn(req, res, next).catch(next);
 
 function isExpired(lic, now) {
     return lic.type !== 'perpetual' && lic.expires_at && lic.expires_at <= now;
@@ -66,12 +71,12 @@ const activateLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 5,
     standardHeaders: true, legacyHeaders: false,
     message: { error: 'too-many-attempts' } });
 
-app.post('/api/license/activate', activateLimiter, (req, res) => {
+app.post('/api/license/activate', activateLimiter, wrap(async (req, res) => {
     const parsed = ActivateSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'invalid-body' });
     const { key, machineId } = parsed.data;
 
-    const lic = stmts.findKey.get(key);
+    const lic = await stmts.findKey(key);
     if (!lic) {
         logEvent(key, 'reject', machineId, req.ip, 'not-found');
         return res.status(404).json({ error: 'unknown-key' });
@@ -94,7 +99,7 @@ app.post('/api/license/activate', activateLimiter, (req, res) => {
             logEvent(key, 'reject', machineId, req.ip, 'machine-mismatch');
             return res.status(409).json({ error: 'in-use-elsewhere' });
         }
-        stmts.touchVerify.run(now, key, machineId);
+        await stmts.touchVerify(now, key, machineId);
         const token = hmac.sign({
             key, machineId, type: lic.type, pack: lic.pack,
             expiresAt: lic.expires_at, issuedAt: now, v: 1,
@@ -105,7 +110,7 @@ app.post('/api/license/activate', activateLimiter, (req, res) => {
     }
 
     // Fresh activation: pool -> activated.
-    const r = stmts.activate.run(machineId, now, now, key);
+    const r = await stmts.activate(machineId, now, now, key);
     if (r.changes !== 1) {
         // Race: another concurrent /activate beat us to it.
         logEvent(key, 'reject', machineId, req.ip, 'race-lost');
@@ -118,7 +123,7 @@ app.post('/api/license/activate', activateLimiter, (req, res) => {
     logEvent(key, 'activate', machineId, req.ip, 'fresh');
     return res.json({ ok: true, token, type: lic.type, pack: lic.pack,
                       expiresAt: lic.expires_at });
-});
+}));
 
 // Verify: heartbeat. Lighter rate limit -- a healthy client calls
 // at most once per startup + once per N days in the background.
@@ -126,7 +131,7 @@ const verifyLimiter = rateLimit({ windowMs: 60 * 1000, max: 30,
     standardHeaders: true, legacyHeaders: false,
     message: { error: 'too-many-requests' } });
 
-app.post('/api/license/verify', verifyLimiter, (req, res) => {
+app.post('/api/license/verify', verifyLimiter, wrap(async (req, res) => {
     const parsed = VerifySchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'invalid-body' });
     const { key, machineId, token } = parsed.data;
@@ -138,7 +143,7 @@ app.post('/api/license/verify', verifyLimiter, (req, res) => {
         return res.status(401).json({ error: 'bad-token' });
     }
 
-    const lic = stmts.findKey.get(key);
+    const lic = await stmts.findKey(key);
     if (!lic || lic.status !== 'activated' || lic.machine_id !== machineId) {
         logEvent(key, 'reject', machineId, req.ip, 'not-activated');
         return res.status(403).json({ error: 'not-activated' });
@@ -149,7 +154,7 @@ app.post('/api/license/verify', verifyLimiter, (req, res) => {
         return res.status(403).json({ error: 'expired' });
     }
 
-    stmts.touchVerify.run(now, key, machineId);
+    await stmts.touchVerify(now, key, machineId);
     // Re-issue a fresh token so the client's offline grace period
     // restarts each successful verify.
     const newToken = hmac.sign({
@@ -159,9 +164,9 @@ app.post('/api/license/verify', verifyLimiter, (req, res) => {
     logEvent(key, 'verify', machineId, req.ip, null);
     return res.json({ ok: true, token: newToken, pack: lic.pack,
                       expiresAt: lic.expires_at });
-});
+}));
 
-app.post('/api/license/deactivate', verifyLimiter, (req, res) => {
+app.post('/api/license/deactivate', verifyLimiter, wrap(async (req, res) => {
     const parsed = DeactivateSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'invalid-body' });
     const { key, machineId, token } = parsed.data;
@@ -172,14 +177,14 @@ app.post('/api/license/deactivate', verifyLimiter, (req, res) => {
         return res.status(401).json({ error: 'bad-token' });
     }
 
-    const r = stmts.deactivate.run(key, machineId);
+    const r = await stmts.deactivate(key, machineId);
     if (r.changes !== 1) {
         logEvent(key, 'reject', machineId, req.ip, 'deactivate-mismatch');
         return res.status(409).json({ error: 'not-activated-here' });
     }
     logEvent(key, 'deactivate', machineId, req.ip, null);
     return res.json({ ok: true });
-});
+}));
 
 // ---------------------------------------------------------------
 // Admin
@@ -206,71 +211,65 @@ const ListQuerySchema = z.object({
     q:      z.string().trim().min(1).max(64).optional(),
 });
 
-app.get('/api/admin/keys', requireAdmin, (req, res) => {
+app.get('/api/admin/keys', requireAdmin, wrap(async (req, res) => {
     const parsed = ListQuerySchema.safeParse(req.query);
     if (!parsed.success) return res.status(400).json({ error: 'invalid-query' });
     const { limit, offset, status, type, pack, q } = parsed.data;
 
     const where = [];
-    const params = { now: nowSec() };
+    const params = [];
+    const p = v => { params.push(v); return `$${params.length}`; };
 
     if (status === 'expired') {
-        where.push(`type != 'perpetual' AND expires_at IS NOT NULL AND expires_at <= @now`);
+        where.push(`type != 'perpetual' AND expires_at IS NOT NULL AND expires_at <= ${p(nowSec())}`);
     } else if (status) {
-        where.push('status = @status');
-        params.status = status;
+        where.push(`status = ${p(status)}`);
     }
-    if (type) {
-        where.push('type = @type');
-        params.type = type;
-    }
-    if (pack) {
-        where.push('pack = @pack');
-        params.pack = pack;
-    }
+    if (type) where.push(`type = ${p(type)}`);
+    if (pack) where.push(`pack = ${p(pack)}`);
     if (q) {
         // Key search is case-insensitive and ignores the dashes so an
         // admin can paste "xgvjx9yy5s" or the formatted key and hit the
         // same row. Notes hold the customer email / order id.
-        where.push(`(REPLACE(key,'-','') LIKE @qkey OR notes LIKE @qnotes)`);
-        params.qkey   = `%${q.replace(/-/g, '').toUpperCase()}%`;
-        params.qnotes = `%${q}%`;
+        where.push(`(REPLACE(key,'-','') ILIKE ${p(`%${q.replace(/-/g, '')}%`)}`
+                 + ` OR notes ILIKE ${p(`%${q}%`)})`);
     }
 
     const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-    const rows = db.prepare(`
+    const rows = await all(`
         SELECT * FROM licenses ${clause}
-        ORDER BY created_at DESC LIMIT @limit OFFSET @offset
-    `).all({ ...params, limit, offset });
+        ORDER BY created_at DESC LIMIT ${p(limit)} OFFSET ${p(offset)}
+    `, params);
 
     // Total for the same filter set, so a paginated client knows how
     // many pages exist without walking them.
-    const { total } = db.prepare(
-        `SELECT COUNT(*) AS total FROM licenses ${clause}`
-    ).get(params);
+    const { total } = await get(
+        `SELECT COUNT(*) AS total FROM licenses ${clause}`,
+        params.slice(0, -2)
+    );
 
     res.json({ ok: true, rows, total, limit, offset });
-});
+}));
 
 // Aggregate counters + daily series for the admin dashboard. Cheap
 // enough to compute per request at license scale (a handful of full
 // scans over a table that stays in page cache).
-app.get('/api/admin/stats', requireAdmin, (req, res) => {
+app.get('/api/admin/stats', requireAdmin, wrap(async (req, res) => {
     const now = nowSec();
     const day = 86400;
-    const c = stmts.counts.get({
+    const c = await stmts.counts({
         now,
         since24h: now - day,
         since7d:  now - 7 * day,
         since30d: now - 30 * day,
     });
 
-    // SUM() over zero rows is NULL, not 0 -- normalise so a fresh DB
-    // renders as zeros rather than blanks.
+    // COUNT() FILTER is never NULL, but keep the guard so a missing
+    // column renders as zero rather than blank.
     const n = (v) => v ?? 0;
     const windowStart = now - 30 * day;
-    const created   = new Map(stmts.createdSeries.all(windowStart).map(r => [r.day, r.n]));
-    const activated = new Map(stmts.activatedSeries.all(windowStart).map(r => [r.day, r.n]));
+    const created   = new Map((await stmts.createdSeries(windowStart)).map(r => [r.day, r.n]));
+    const activated = new Map((await stmts.activatedSeries(windowStart)).map(r => [r.day, r.n]));
 
     // Emit every day in the window, including the empty ones, so the
     // client can render a continuous axis without filling gaps itself.
@@ -318,9 +317,9 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
             activated30d: n(c.activated_30d),
         },
         series,
-        events: stmts.recentEvents.all(15),
+        events: await stmts.recentEvents(15),
     });
-});
+}));
 
 // Create a fresh key in the pool. Called by the Elyonis website after
 // a successful Stripe checkout: the website POSTs the order details,
@@ -340,7 +339,7 @@ const AdminCreateSchema = z.object({
     notes: z.string().max(256).optional(),
 });
 
-app.post('/api/admin/keys', requireAdmin, (req, res) => {
+app.post('/api/admin/keys', requireAdmin, wrap(async (req, res) => {
     const parsed = AdminCreateSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'invalid-body' });
     const { type, durationDays, pack, notes } = parsed.data;
@@ -361,14 +360,14 @@ app.post('/api/admin/keys', requireAdmin, (req, res) => {
     let key = null;
     for (let i = 0; i < 8; i++) {
         const candidate = randomKey();
-        if (!stmts.findKey.get(candidate)) { key = candidate; break; }
+        if (!(await stmts.findKey(candidate))) { key = candidate; break; }
     }
     if (!key) return res.status(500).json({ error: 'key-generation-failed' });
 
-    stmts.insertKey.run(key, now, type, expiresAt, pack, notes ?? null);
+    await stmts.insertKey(key, now, type, expiresAt, pack, notes ?? null);
     logEvent(key, 'create', null, req.ip, `admin/${type}/${pack}`);
     res.status(201).json({ ok: true, key, type, pack, expiresAt });
-});
+}));
 
 // Push a key's expiry forward. Called by the website on every paid
 // Stripe renewal invoice (subscriptions). Never shortens a key: a late
@@ -378,36 +377,31 @@ const AdminExtendSchema = z.object({
     expiresAt: z.number().int().positive(),
 });
 
-app.post('/api/admin/keys/:key/extend', requireAdmin, (req, res) => {
+app.post('/api/admin/keys/:key/extend', requireAdmin, wrap(async (req, res) => {
     const parsed = AdminExtendSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'invalid-body' });
-    const r = stmts.extendKey.run(parsed.data.expiresAt, req.params.key);
+    const r = await stmts.extendKey(parsed.data.expiresAt, req.params.key);
     if (r.changes !== 1) return res.status(404).json({ error: 'unknown-key' });
-    const lic = stmts.findKey.get(req.params.key);
+    const lic = await stmts.findKey(req.params.key);
     logEvent(req.params.key, 'extend', null, req.ip, String(lic.expires_at));
     res.json({ ok: true, key: lic.key, expiresAt: lic.expires_at });
-});
+}));
 
-app.post('/api/admin/keys/:key/revoke', requireAdmin, (req, res) => {
-    const r = stmts.revokeKey.run(req.params.key);
+app.post('/api/admin/keys/:key/revoke', requireAdmin, wrap(async (req, res) => {
+    const r = await stmts.revokeKey(req.params.key);
     if (r.changes !== 1) return res.status(404).json({ error: 'unknown-key' });
     logEvent(req.params.key, 'revoke', null, req.ip, 'admin');
     res.json({ ok: true });
-});
+}));
 
 // Force-reset (back to pool). Used when a licensee lost their old
 // machine and can't /deactivate from there.
-app.post('/api/admin/keys/:key/reset', requireAdmin, (req, res) => {
-    const r = db.prepare(`
-        UPDATE licenses
-        SET status='pool', machine_id=NULL,
-            activated_at=NULL, last_verify_at=NULL
-        WHERE key = ? AND status != 'revoked'
-    `).run(req.params.key);
+app.post('/api/admin/keys/:key/reset', requireAdmin, wrap(async (req, res) => {
+    const r = await stmts.resetKey(req.params.key);
     if (r.changes !== 1) return res.status(404).json({ error: 'unknown-key' });
     logEvent(req.params.key, 'reset', null, req.ip, 'admin');
     res.json({ ok: true });
-});
+}));
 
 // ---------------------------------------------------------------
 // Health
@@ -417,6 +411,12 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.use((_req, res) => res.status(404).json({ error: 'not-found' }));
+
+// DB failures (Neon unreachable, constraint violation...) land here via wrap().
+app.use((err, _req, res, _next) => {
+    console.error('request failed:', err.message);
+    res.status(500).json({ error: 'internal' });
+});
 
 app.listen(PORT, () => {
     console.log(`elyonis-license server listening on :${PORT}`);

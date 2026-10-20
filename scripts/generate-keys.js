@@ -20,7 +20,7 @@
 //   node scripts/generate-keys.js 25 subscription 1798761600 "Q3 2026 batch" --pack=premium
 // =============================================================
 
-import { db, stmts, nowSec } from '../src/db.js';
+import { pool, stmts, nowSec } from '../src/db.js';
 import { randomKey } from '../src/keys.js';
 
 // Pull the flag out first so it never lands in a positional slot, whatever
@@ -49,20 +49,29 @@ if ((type === 'subscription' || type === 'trial') && !expiresAt) {
 }
 
 const now = nowSec();
-const insert = db.transaction(keys => {
-    for (const k of keys) stmts.insertKey.run(k, now, type, expiresAt, pack, notes);
-});
 
 const fresh = [];
 let tries = 0;
 while (fresh.length < count && tries < count * 4) {
     tries++;
     const k = randomKey();
-    if (stmts.findKey.get(k)) continue;   // collision (extremely unlikely)
+    if (await stmts.findKey(k)) continue;   // collision (extremely unlikely)
     fresh.push(k);
 }
 
-insert(fresh);
+// All-or-nothing: a half-inserted batch is worse than none.
+const client = await pool.connect();
+try {
+    await client.query('BEGIN');
+    for (const k of fresh) await stmts.insertKey(k, now, type, expiresAt, pack, notes, client);
+    await client.query('COMMIT');
+} catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+} finally {
+    client.release();
+}
+await pool.end();
 
 // CSV out so it's trivial to import into a spreadsheet for ops. The pack is a
 // column of its own: a batch is worthless to ops if you can't tell which keys
