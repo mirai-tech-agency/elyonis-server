@@ -148,6 +148,7 @@ export const stmts = {
         VALUES ($1, 'pool', $2, $3, $4, $5, $6)
     `, [key, now, type, expiresAt, pack, notes]),
     revokeKey: key => run(`UPDATE licenses SET status = 'revoked' WHERE key = $1`, [key]),
+    setNotes: (notes, key) => run(`UPDATE licenses SET notes = $1 WHERE key = $2`, [notes, key]),
     extendKey: (expiresAt, key) => run(`
         UPDATE licenses
         SET expires_at = GREATEST(COALESCE(expires_at, 0), $1)

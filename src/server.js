@@ -387,6 +387,23 @@ app.post('/api/admin/keys/:key/extend', requireAdmin, wrap(async (req, res) => {
     res.json({ ok: true, key: lic.key, expiresAt: lic.expires_at });
 }));
 
+// Replace a key's notes (dashboard). Notes carry the Stripe reference the
+// website's renewal webhook searches for ("stripe sub_..."), so an admin can
+// attach a subscription to a key minted by hand. Empty string clears them.
+const AdminNotesSchema = z.object({
+    notes: z.string().trim().max(256),
+});
+
+app.post('/api/admin/keys/:key/notes', requireAdmin, wrap(async (req, res) => {
+    const parsed = AdminNotesSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid-body' });
+    const notes = parsed.data.notes || null;
+    const r = await stmts.setNotes(notes, req.params.key);
+    if (r.changes !== 1) return res.status(404).json({ error: 'unknown-key' });
+    logEvent(req.params.key, 'notes', null, req.ip, 'admin');
+    res.json({ ok: true, key: req.params.key, notes });
+}));
+
 app.post('/api/admin/keys/:key/revoke', requireAdmin, wrap(async (req, res) => {
     const r = await stmts.revokeKey(req.params.key);
     if (r.changes !== 1) return res.status(404).json({ error: 'unknown-key' });
