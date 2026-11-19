@@ -8,9 +8,12 @@
 
 const ENDPOINT = 'https://api.elevenlabs.io/v1/text-to-speech';
 
-// Modèle multilingue : c'est lui qui sait lire le français. Surchargeable
-// au cas où ElevenLabs sorte mieux (ou qu'on change de fournisseur).
-const MODEL = process.env.ELEVENLABS_MODEL ?? 'eleven_multilingual_v2';
+// Flash v2.5 + language_code « fr » : le forfait gratuit interdit les voix
+// françaises natives, forcer la langue est ce qui réduit le plus l'accent
+// anglais des voix par défaut (et Flash coûte moitié moins de crédits).
+const MODEL = process.env.ELEVENLABS_MODEL ?? 'eleven_flash_v2_5';
+// multilingual_v2 refuse language_code : on ne l'envoie qu'aux modèles v2.5+.
+const LANGUAGE = MODEL === 'eleven_multilingual_v2' ? null : 'fr';
 
 // MP3 22 kHz / 32 kbps : largement suffisant pour de la parole et ~4x plus
 // léger que du 44 kHz, donc une lecture qui démarre plus vite sur ADSL.
@@ -63,6 +66,7 @@ export async function synthesize({ text, voice = 0, speed = 5, tone = 5 }) {
     const body = {
         text,
         model_id: MODEL,
+        ...(LANGUAGE && { language_code: LANGUAGE }),
         voice_settings: {
             // « Ton » : du plus posé/neutre au plus expressif.
             stability: scale(11 - tone, 0.25, 0.75, 0.5),
