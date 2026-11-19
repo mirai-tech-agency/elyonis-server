@@ -75,8 +75,29 @@ await pool.query(`
     pack           TEXT NOT NULL DEFAULT 'premium'
                    CHECK (pack IN ('basic','premium','pro')),
 
+    -- Plafond MENSUEL de caractères de synthèse en voix naturelles
+    -- (ElevenLabs, via /api/tts). 0 = la licence n'y a PAS droit : un seul
+    -- champ dit à la fois « a le droit » et « jusqu'où », il n'y a donc pas
+    -- deux états à garder d'accord. Remis à neuf chaque mois civil (UTC).
+    tts_quota      INTEGER NOT NULL DEFAULT 0,
+
     -- Admin-only metadata: customer name, order id, batch label, etc.
     notes          TEXT
+  );
+
+  -- Colonne ajoutée après coup : les bases déjà en service n'ont pas été
+  -- recréées par le CREATE TABLE IF NOT EXISTS ci-dessus.
+  ALTER TABLE licenses ADD COLUMN IF NOT EXISTS tts_quota INTEGER NOT NULL DEFAULT 0;
+
+  -- Consommation de synthèse, un compteur par licence et par mois civil.
+  -- Garder l'historique par mois (plutôt qu'un compteur remis à zéro) permet
+  -- de montrer la tendance dans le dashboard sans table d'audit séparée.
+  CREATE TABLE IF NOT EXISTS tts_usage (
+    key        TEXT NOT NULL REFERENCES licenses(key),
+    month      TEXT NOT NULL,          -- 'YYYY-MM' (UTC)
+    chars      BIGINT NOT NULL DEFAULT 0,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (key, month)
   );
 
   CREATE INDEX IF NOT EXISTS idx_licenses_machine_id ON licenses(machine_id);
@@ -208,6 +229,31 @@ export const stmts = {
         FROM license_events ORDER BY created_at DESC, id DESC LIMIT $1
     `, [limit]),
 
+    // --- Voix naturelles -----------------------------------------
+    setTtsQuota: (quota, key) => run(
+        `UPDATE licenses SET tts_quota = $1 WHERE key = $2`, [quota, key]),
+
+    ttsUsed: (key, month) => get(
+        `SELECT chars FROM tts_usage WHERE key = $1 AND month = $2`, [key, month]),
+
+    // Un seul aller-retour : on incrémente et on relit le total, pour que
+    // deux lectures simultanées ne puissent pas dépasser le plafond chacune
+    // de son côté (le UPDATE est atomique, le SELECT d'avant ne l'était pas).
+    ttsAdd: (key, month, chars, now) => get(`
+        INSERT INTO tts_usage(key, month, chars, updated_at)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (key, month) DO UPDATE
+          SET chars = tts_usage.chars + excluded.chars, updated_at = excluded.updated_at
+        RETURNING chars
+    `, [key, month, chars, now]),
+
+    // Annulation quand l'appel au fournisseur a échoué après coup : on ne
+    // facture pas à l'utilisateur une lecture qu'il n'a pas entendue.
+    ttsRefund: (key, month, chars) => run(`
+        UPDATE tts_usage SET chars = GREATEST(0, chars - $3)
+        WHERE key = $1 AND month = $2
+    `, [key, month, chars]),
+
     logEvent: (key, event, machineId, ip, detail, createdAt) => run(`
         INSERT INTO license_events(key, event, machine_id, ip, detail, created_at)
         VALUES ($1, $2, $3, $4, $5, $6)
@@ -215,3 +261,10 @@ export const stmts = {
 };
 
 export function nowSec() { return Math.floor(Date.now() / 1000); }
+
+// Mois civil UTC courant ('YYYY-MM'), la fenêtre de facturation des voix
+// naturelles. UTC et non l'heure locale : le serveur et le dashboard doivent
+// désigner le même mois quelle que soit leur zone.
+export function currentMonth(d = new Date()) {
+    return d.toISOString().slice(0, 7);
+}

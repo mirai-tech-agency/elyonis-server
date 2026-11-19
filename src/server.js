@@ -17,9 +17,10 @@ import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 
-import { all, get, stmts, nowSec } from './db.js';
+import { all, get, stmts, nowSec, currentMonth } from './db.js';
 import { randomKey } from './keys.js';
 import * as hmac from './hmac.js';
+import * as tts from './tts.js';
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
@@ -30,7 +31,9 @@ if (!ADMIN_TOKEN || ADMIN_TOKEN.length < 16) {
 
 const app = express();
 app.disable('x-powered-by');
-app.use(express.json({ limit: '4kb' }));
+// 32 ko : /api/tts porte un morceau de texte à lire (plafonné à MAX_CHARS,
+// qui peut faire ~15 ko en UTF-8 accentué), les autres routes restent minuscules.
+app.use(express.json({ limit: '32kb' }));
 
 // Trust the upstream proxy (Cloudflare Tunnel) so req.ip == real client IP.
 app.set('trust proxy', 1);
@@ -51,6 +54,30 @@ const wrap = fn => (req, res, next) => fn(req, res, next).catch(next);
 
 function isExpired(lic, now) {
     return lic.type !== 'perpetual' && lic.expires_at && lic.expires_at <= now;
+}
+
+// « Ce client a-t-il une licence vivante sur CETTE machine ? » — le contrôle
+// commun à /verify et /tts. Rend la ligne de licence, ou répond lui-même
+// l'erreur et rend null (l'appelant n'a plus qu'à `return`).
+async function liveLicense(req, res, { key, machineId, token }, now) {
+    const payload = hmac.verify(token);
+    if (!payload || payload.key !== key || payload.machineId !== machineId) {
+        logEvent(key, 'reject', machineId, req.ip, 'bad-token');
+        res.status(401).json({ error: 'bad-token' });
+        return null;
+    }
+    const lic = await stmts.findKey(key);
+    if (!lic || lic.status !== 'activated' || lic.machine_id !== machineId) {
+        logEvent(key, 'reject', machineId, req.ip, 'not-activated');
+        res.status(403).json({ error: 'not-activated' });
+        return null;
+    }
+    if (isExpired(lic, now)) {
+        logEvent(key, 'reject', machineId, req.ip, 'expired');
+        res.status(403).json({ error: 'expired' });
+        return null;
+    }
+    return lic;
 }
 
 const ActivateSchema   = z.object({ key: z.string().min(10).max(40),
@@ -136,23 +163,9 @@ app.post('/api/license/verify', verifyLimiter, wrap(async (req, res) => {
     if (!parsed.success) return res.status(400).json({ error: 'invalid-body' });
     const { key, machineId, token } = parsed.data;
 
-    // Reject obviously-forged tokens before touching the DB.
-    const payload = hmac.verify(token);
-    if (!payload || payload.key !== key || payload.machineId !== machineId) {
-        logEvent(key, 'reject', machineId, req.ip, 'bad-token');
-        return res.status(401).json({ error: 'bad-token' });
-    }
-
-    const lic = await stmts.findKey(key);
-    if (!lic || lic.status !== 'activated' || lic.machine_id !== machineId) {
-        logEvent(key, 'reject', machineId, req.ip, 'not-activated');
-        return res.status(403).json({ error: 'not-activated' });
-    }
     const now = nowSec();
-    if (isExpired(lic, now)) {
-        logEvent(key, 'reject', machineId, req.ip, 'expired');
-        return res.status(403).json({ error: 'expired' });
-    }
+    const lic = await liveLicense(req, res, parsed.data, now);
+    if (!lic) return;
 
     await stmts.touchVerify(now, key, machineId);
     // Re-issue a fresh token so the client's offline grace period
@@ -184,6 +197,77 @@ app.post('/api/license/deactivate', verifyLimiter, wrap(async (req, res) => {
     }
     logEvent(key, 'deactivate', machineId, req.ip, null);
     return res.json({ ok: true });
+}));
+
+// ---------------------------------------------------------------
+// Voix naturelles
+// ---------------------------------------------------------------
+// Le catalogue (noms seuls — jamais les identifiants du fournisseur) est
+// public : Elyonis l'affiche dans « Voix > Synthèse vocale » avant même
+// d'avoir lu quoi que ce soit.
+app.get('/api/tts/voices', (_req, res) => {
+    res.json({ ok: true, configured: tts.configured(),
+               voices: tts.voices().map(v => ({ name: v.name })) });
+});
+
+// Une lecture = un appel. 20/min laisse passer un long texte découpé en
+// morceaux tout en bornant la facture si un client part en boucle.
+const ttsLimiter = rateLimit({ windowMs: 60 * 1000, max: 20,
+    standardHeaders: true, legacyHeaders: false,
+    message: { error: 'too-many-requests' } });
+
+const TtsSchema = z.object({
+    key:       z.string().min(10).max(40),
+    machineId: z.string().min(8).max(128),
+    token:     z.string().min(20).max(2048),
+    text:      z.string().min(1).max(tts.MAX_CHARS),
+    voice:     z.coerce.number().int().min(0).max(7).default(0),
+    speed:     z.coerce.number().int().min(1).max(10).default(5),
+    tone:      z.coerce.number().int().min(1).max(10).default(5),
+});
+
+app.post('/api/tts', ttsLimiter, wrap(async (req, res) => {
+    const parsed = TtsSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid-body' });
+    const { key, machineId, token, text, voice, speed, tone } = parsed.data;
+
+    // Rien de configuré = pas une panne : Elyonis repasse aux voix Windows.
+    if (!tts.configured()) return res.status(503).json({ error: 'tts-not-configured' });
+
+    const now = nowSec();
+    const lic = await liveLicense(req, res, parsed.data, now);
+    if (!lic) return;
+
+    // Le plafond PORTE le droit d'accès : 0 = cette licence n'a pas l'option.
+    const quota = lic.tts_quota | 0;
+    if (quota <= 0) {
+        logEvent(key, 'reject', machineId, req.ip, 'tts-not-allowed');
+        return res.status(403).json({ error: 'tts-not-allowed' });
+    }
+
+    const month = currentMonth();
+    const chars = [...text].length;   // caractères perçus, pas octets UTF-8
+    // On RÉSERVE avant d'appeler le fournisseur (incrément atomique) : deux
+    // lectures lancées en même temps ne peuvent plus franchir le plafond
+    // chacune de son côté. Tout échec en aval rend les caractères.
+    const { chars: used } = await stmts.ttsAdd(key, month, chars, now);
+    if (used > quota) {
+        await stmts.ttsRefund(key, month, chars);
+        logEvent(key, 'reject', machineId, req.ip, 'tts-quota');
+        return res.status(429).json({ error: 'tts-quota', used: used - chars, quota });
+    }
+
+    const out = await tts.synthesize({ text, voice, speed, tone });
+    if (!out.ok) {
+        await stmts.ttsRefund(key, month, chars);
+        return res.status(out.status).json({ error: out.error });
+    }
+
+    logEvent(key, 'tts', machineId, req.ip, `${chars}c voix${voice}`);
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('X-Tts-Used', String(used));
+    res.set('X-Tts-Quota', String(quota));
+    res.send(out.audio);
 }));
 
 // ---------------------------------------------------------------
@@ -236,8 +320,15 @@ app.get('/api/admin/keys', requireAdmin, wrap(async (req, res) => {
     }
 
     const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    // Consommation de voix naturelles du mois en cours, en sous-requête
+    // plutôt qu'en jointure : `key` existe dans les deux tables et les
+    // filtres ci-dessus le nomment sans préfixe.
+    const monthParam = p(currentMonth());
     const rows = await all(`
-        SELECT * FROM licenses ${clause}
+        SELECT l.*,
+               COALESCE((SELECT chars FROM tts_usage u
+                         WHERE u.key = l.key AND u.month = ${monthParam}), 0) AS tts_used
+        FROM licenses l ${clause}
         ORDER BY created_at DESC LIMIT ${p(limit)} OFFSET ${p(offset)}
     `, params);
 
@@ -245,7 +336,7 @@ app.get('/api/admin/keys', requireAdmin, wrap(async (req, res) => {
     // many pages exist without walking them.
     const { total } = await get(
         `SELECT COUNT(*) AS total FROM licenses ${clause}`,
-        params.slice(0, -2)
+        params.slice(0, -3)
     );
 
     res.json({ ok: true, rows, total, limit, offset });
@@ -317,9 +408,26 @@ app.get('/api/admin/stats', requireAdmin, wrap(async (req, res) => {
             activated30d: n(c.activated_30d),
         },
         series,
+        tts: await ttsMonthTotals(),
         events: await stmts.recentEvents(15),
     });
 }));
+
+// Voix naturelles, mois en cours : combien de licences y ont droit, combien
+// de caractères ont été consommés, et quel plafond total a été ouvert.
+async function ttsMonthTotals() {
+    const month = currentMonth();
+    const r = await get(`
+        SELECT
+          (SELECT COUNT(*)              FROM licenses  WHERE tts_quota > 0)        AS licenses,
+          -- ::bigint : SUM() rend du NUMERIC, que le pilote pg livre en CHAÎNE.
+          -- Le dashboard formate un nombre, pas « "0" ».
+          (SELECT COALESCE(SUM(tts_quota),0)::bigint FROM licenses WHERE tts_quota > 0) AS quota,
+          (SELECT COALESCE(SUM(chars),0)::bigint     FROM tts_usage WHERE month = $1)   AS used
+    `, [month]);
+    return { month, licenses: r?.licenses ?? 0, quota: r?.quota ?? 0, used: r?.used ?? 0,
+             configured: tts.configured() };
+}
 
 // Create a fresh key in the pool. Called by the Elyonis website after
 // a successful Stripe checkout: the website POSTs the order details,
@@ -402,6 +510,21 @@ app.post('/api/admin/keys/:key/notes', requireAdmin, wrap(async (req, res) => {
     if (r.changes !== 1) return res.status(404).json({ error: 'unknown-key' });
     logEvent(req.params.key, 'notes', null, req.ip, 'admin');
     res.json({ ok: true, key: req.params.key, notes });
+}));
+
+// Plafond mensuel de voix naturelles, en caractères. 0 = l'option n'est pas
+// ouverte sur cette licence (c'est aussi le défaut à la création).
+const AdminTtsSchema = z.object({
+    quota: z.coerce.number().int().min(0).max(10_000_000),
+});
+
+app.post('/api/admin/keys/:key/tts', requireAdmin, wrap(async (req, res) => {
+    const parsed = AdminTtsSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid-body' });
+    const r = await stmts.setTtsQuota(parsed.data.quota, req.params.key);
+    if (r.changes !== 1) return res.status(404).json({ error: 'unknown-key' });
+    logEvent(req.params.key, 'tts-quota', null, req.ip, String(parsed.data.quota));
+    res.json({ ok: true, key: req.params.key, quota: parsed.data.quota });
 }));
 
 app.post('/api/admin/keys/:key/revoke', requireAdmin, wrap(async (req, res) => {

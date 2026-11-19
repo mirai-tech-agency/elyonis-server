@@ -27,3 +27,9 @@ services:
         sync: false
       - key: ADMIN_TOKEN
         sync: false
+      # Voix naturelles. Vides = option désactivée, Elyonis reste sur les
+      # voix Windows (c'est le repli prévu, pas une panne).
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: TTS_VOICES
+        sync: false
